@@ -1,0 +1,24 @@
+services:
+  rust-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rust-proxy
+    ports:
+      - "8080:8080"
+    environment:
+      RUST_PROXY_LOG: "info"
+      PROXY__SERVER__LISTEN_ADDR: "0.0.0.0:8080"
+      PROXY__UPSTREAM__ADDR: "echo-server:9000"
+    depends_on:
+      - echo-server
+    restart: unless-stopped
+
+  echo-server:
+    image: mendhak/http-https-echo:37
+    container_name: echo-server
+    environment:
+      HTTP_PORT: 9000
+    expose:
+      - "9000"
+    restart: unless-stopped
