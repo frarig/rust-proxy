@@ -1,5 +1,7 @@
 [server]
 listen_addr = "0.0.0.0:8080"
+max_connections = 1024
 
 [upstream]
 addr = "echo-server:9000"
+connect_timeout_ms = 3000
