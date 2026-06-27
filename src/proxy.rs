@@ -22,9 +22,9 @@ use tokio::signal;
 
 // Semaphore ограничивает количество одновременных соединений.
 use tokio::sync::Semaphore;
-
+use tokio::task::JoinSet;
 // timeout ограничивает время выполнения async-операции.
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant, Timeout};
 
 // Макросы логирования.
 use tracing::{error, info, warn};
@@ -60,11 +60,23 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
     // Arc нужен, потому что limiter будет использоваться из разных tokio::spawn тасок.
     let connection_limiter = Arc::new(Semaphore::new(settings.server.max_connections));
 
+    // JoinSet хранит все запущенные async-задачи.
+    //
+    // Мы можем:
+    // • узнать, сколько задач сейчас работает;
+    // • дождаться завершения всех задач;
+    // • при необходимости отменить оставшиеся задачи.
+    //
+    // Без JoinSet после Ctrl+C сервер бы завершился,
+    // даже если ещё есть активные соединения.
+    let mut connections = JoinSet::new();
+
     // Пишем стартовый лог.
     info!(
         listen_addr = %settings.server.listen_addr,
         upstream_addr = %settings.upstream.addr,
         max_connections = settings.server.max_connections,
+        shutdown_timeout_ms = settings.server.shutdown_timeout_ms,
         "Starting proxy server"
     );
 
@@ -118,20 +130,13 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
                 // Полученный Arc передаётся в новую async-задачу.
                 let settings = Arc::clone(&settings);
 
-                // tokio::spawn создаёт новую независимую async-задачу.
+                // Регистрируем новую async-задачу в JoinSet.
                 //
-                // После запуска эта задача может жить намного дольше,
-                // чем текущая функция run().
+                // JoinSet внутри самостоятельно вызывает tokio::spawn(),
+                // но дополнительно начинает отслеживать жизненный цикл задачи.
                 //
-                // Поэтому она не может просто взять ссылку (&Settings).
-                // Компилятор не сможет гарантировать,
-                // что объект Settings будет существовать всё время жизни задачи.
-                //
-                // Arc решает эту проблему:
-                // задача получает собственного владельца Settings,
-                // поэтому объект будет существовать,
-                // пока существует хотя бы один Arc.
-                tokio::spawn(async move {
+                // Позже мы сможем дождаться её завершения через join_next().
+                connections.spawn(async move {
                     // Кладём permit внутрь таски.
                     //
                     // Пока _permit живёт, слот Semaphore занят.
@@ -147,6 +152,25 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
                         );
                     }
                 });
+            }
+
+            // Проверяем, завершилась ли какая-нибудь ранее запущенная задача.
+            // join_next() возвращает первую завершившуюся задачу.
+            //
+            // Благодаря этому JoinSet постепенно очищается и в памяти не остаются сведения
+            // о давно завершившихся соединениях.
+            join_result = connections.join_next(), if !connections.is_empty() => {
+                // join_next() возвращает:
+                // Some(...) — задача завершилась.
+                // None — задач больше нет.
+                if let Some(result) = join_result {
+                    // Если сама async-задача завершилась аварийно (panic или abort), логируем ошибку.
+                    //
+                    // Ошибки handle_connection сюда не попадают, потому что они уже обработаны внутри самой задачи.
+                    if let Err(error) = result {
+                        error!(%error, "Connection task panicked or was canceled");
+                    }
+                }
             }
 
             // Ветка shutdown.
@@ -171,14 +195,100 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
     // Логируем, что новые соединения больше не принимаются.
     info!("Proxy server stopped accepting new connections");
 
+    // Новые соединения больше не принимаются.
+    //
+    // Теперь нужно дождаться, пока уже работающие соединения закончат работу.
+    wait_for_connections(
+        connections,
+        Duration::from_millis(settings.server.shutdown_timeout_ms),
+    ).await;
+
+    info!("Proxy server stopped");
+
     // Возвращаем успешный результат.
     Ok(())
+}
+
+
+// Отдельная функция, отвечающая за корректное завершение приложения.
+//
+// Она ждёт завершения всех активных соединений, но не дольше shutdown_timeout.
+async fn wait_for_connections(mut connections: JoinSet<()>, shutdown_timeout: Duration) {
+    // Если активных соединений нет, ждать нечего.
+    if connections.is_empty() {
+        info!("No active connections to wait for");
+        return;
+    }
+
+    // Вычисляем момент времени, после которого ожидание прекращается.
+    //
+    // Например:
+    // сейчас 12:00:00
+    // timeout = 10 секунд
+    // deadline = 12:00:10
+    let deadline = Instant::now() + shutdown_timeout;
+
+    // Показываем, сколько соединений осталось завершить.
+    info!(
+        active_connections = connections.len(),
+        shutdown_timeout_ms = shutdown_timeout.as_millis(),
+        "Waiting for active connections to finish"
+    );
+
+    // Пока существуют активные задачи, продолжаем ждать.
+    while !connections.is_empty() {
+        // Получаем текущее время.
+        let now = Instant::now();
+
+        // Проверяем, не истекло ли максимально допустимое время ожидания.
+        if now >= deadline {
+            warn!(
+                active_connections = connections.len(),
+                "Shutdown timeout reached, aborting active connections"
+            );
+
+            // Принудительно отменяем все оставшиеся async-задачи.
+            connections.abort_all();
+            return;
+        }
+
+        // Сколько времени ещё можно ждать до наступления deadline.
+        let remaining = deadline - now;
+
+        // Ждём завершения следующей задачи, но не дольше remaining.
+        //
+        // timeout гарантирует, что ожидание не станет бесконечным.
+        match timeout(remaining, connections.join_next()).await {
+            // Очередная задача успешно завершилась.
+            // Ничего делать не нужно. Переходим к ожиданию следующей.
+            Ok(Some(Ok(()))) => {}
+            // Задача завершилась аварийно. Если внутри задачи произошёл panic.
+            Ok(Some(Err(error))) => {
+                error!(%error, "Connection task panicked or was canceled");
+            }
+            // Все задачи завершились. Можно заканчивать shutdown.
+            Ok(None) => {
+                break;
+            }
+            // timeout истёк.
+            // Даже если задачи ещё работают, сервер больше ждать не будет.
+            Err(_) => {
+                warn!(
+                    active_connections = connections.len(),
+                    "Shutdown timeout reached, aborting active connections"
+                );
+
+                connections.abort_all();
+                break;
+            }
+        }
+    }
 }
 
 // Обработка одного TCP-соединения.
 //
 // client — соединение от пользователя к прокси.
-// settings — настройки приложения.
+// settings — настройки приложения. Все соединения используют один и тот же объект настроек, не создавая его копии.
 async fn handle_connection(mut client: TcpStream, settings: Arc<Settings>) -> anyhow::Result<()> {
     // Создаём Duration из миллисекунд из конфига.
     let connection_timeout = Duration::from_millis(settings.upstream.connect_timeout_ms);
